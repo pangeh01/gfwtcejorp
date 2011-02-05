@@ -1,0 +1,6 @@
+FILE=10d/ran.150pts.10d.20
+gcc -Wall -Werror -pedantic -std=c99 -o correct wfglyndon.c
+gcc -Wall -Werror -pedantic -std=c99 -o read wfg\ 9.c
+./correct $FILE debug
+./read $FILE debug
+diff correct.txt test.txt
