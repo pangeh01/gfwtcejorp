@@ -29,6 +29,8 @@
 #include <sys/time.h>
 #include <sys/resource.h>
 #include <math.h>
+#include "cutil.h"
+//#include "radixsort.cu"
 
 //extern double ehv(int index, FRONT front);
 //extern double hypervolume(FRONT front);
@@ -39,6 +41,7 @@
 // Global Variables
 /////////////////////////////////////////////////////////
 
+//int maxDepth = -1;	//the maximum depth you have reached
 int n = 0; //the dimension of the current front we are working on
 int iteration = 0;	//depth of the recursion starting from 0
 double hypervolume(FRONT);
@@ -254,8 +257,12 @@ void limitset(int index, FRONT front) {
 	computeEliminatedArray<<< z, z >>>(d_temp, n, d_eliminated);
 	cudaThreadSynchronize();
 	
+	int N = z;
+	int blockSize = 512;
+	int nBlocks = N/blockSize + (N%blockSize == 0 ? 0:1);
+
 	/* <4> Compute prefix-sum in parallel */
-	scan_best<<< 256, 512/2, sizeof(int)*(512) >>>(d_scanoutput, d_eliminated, 512);
+	scan_best<<< nBlocks, blockSize/2, sizeof(int)*(blockSize) >>>(d_scanoutput, d_eliminated, blockSize);
 	cudaThreadSynchronize();
 	scan_inclusive<<< 1, z >>>(d_scanoutput, d_eliminated, z);  //make the result into an inclusive scan result.
 	cudaThreadSynchronize();
@@ -453,14 +460,42 @@ void hvnew() {
 }
 
 /**
+ *  Timer Functions
+ */
+void run(int argc, char *argv[])
+{
+    unsigned int timer = 0;
+
+    CUT_DEVICE_INIT(argc, argv);
+
+    /////////////////////////////////////////////////////////////////////
+    // Create and start a timer called "timer"
+    // alls to create ans start times are enveloped in the CUT_SAFE_CALL
+    // This CUDA Utility Tool checks for errors upon return.
+    // If an error is found, it prints out and error message, file name,
+    // and line number in file where the error can be found
+    /////////////////////////////////////////////////////////////////////
+    timer = 0;
+    CUT_SAFE_CALL(cutCreateTimer(&timer));
+    CUT_SAFE_CALL(cutStartTimer(timer));
+    
+    // Stop the timer
+    CUT_SAFE_CALL(cutStopTimer(timer));
+    printf( "Processing time: %f (ms)\n", cutGetTimerValue(timer));
+
+    // Delete the timer
+    CUT_SAFE_CALL(cutDeleteTimer(timer));
+}
+
+/**
  * Runs a parallel hypervolume
  */ 
 __global__ void hvparallel() {
 	// Should call many device functions
 
-	sortParallel();
+	//sortParallel();
 
-	d_indexStack[0] = d_frontsArray[0].nPoints - 1;
+	//d_indexStack[0] = d_frontsArray[0].nPoints - 1;
 	
 }
 
@@ -526,22 +561,11 @@ int main(int argc, char *argv[]) {
 
 	//process each front to get the hypervolumes
 	for (int i = 0; i < f->nFronts; i++) {
-		frontsArray[0] = f->fronts[i];
+		FRONT front = f->fronts[i];
 		n = f->fronts[i].n;
 
-		/* copy front to device memory */
-		double h_front[frontsArray[0].nPoints*n];
-		for (int j = 0; j < frontsArray[0].nPoints; j++) {
-			for (int k = 0; k < n; k++) {
-				h_front[j*n+k] = frontsArray[0].points[j].objectives[k];
-			}
-		}
-		cudaMemcpy(d_frontsArray, h_front, frontsArray[0].nPoints*n*sizeof(double), cudaMemcpyHostToDevice);
-
-
-		hvnew(); 
 		printf("Calculating Hypervolume for Front:%d...\n", i+1);
-		printf("\t\t\t\t\t%1.10f\n", hvStack[0]);
+		printf("\t\t\t\t\t%1.10f\n", hypervolume(front));
 	}
 	
 	getrusage (RUSAGE_SELF, &ru_after);
