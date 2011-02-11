@@ -23,17 +23,23 @@
 // Includes and Defines
 /////////////////////////////////////////////////////////
 
+//#define CUDPP_STATIC_LIB
+#include "/usr/local/NVIDIA_GPU_Computing_SDK/C/common/inc/cudpp/cudpp.h"
 #include "read.c"
 #include "scan_best_kernel.cu"
 #include <stdbool.h>
 #include <sys/time.h>
 #include <sys/resource.h>
 #include <math.h>
+#include "cutil.h"
+//#include "radixsort.cu"
 
-//extern double ehv(int index, FRONT front);
-//extern double hypervolume(FRONT front);
+//extern float ehv(int index, FRONT front);
+//extern float hypervolume(FRONT front);
 
 #define MIN(x, y) ((x < y) ? (x) : (y))
+unsigned int frontSize;
+unsigned int pointSize;
 
 /////////////////////////////////////////////////////////
 // Global Variables
@@ -42,33 +48,32 @@
 //int maxDepth = -1;	//the maximum depth you have reached
 int n = 0; //the dimension of the current front we are working on
 int iteration = 0;	//depth of the recursion starting from 0
-double hypervolume(FRONT);
+float hypervolume(FRONT);
 FRONT *fr;	//storage for storing array of sprimed/non-dominating fronts as we go deeper into the recursion
 
 /* new hypervolume variables */
 FRONT *fs;      // the stack of fronts
 int *ps;        // the indices of the contributing points
-double *vs;     // partial volumes
-double *evs;    // exclusive volumes
+float *vs;     // partial volumes
+float *evs;    // exclusive volumes
 
 /* Device global variables */
-double *d_temp;
-double *d_front;
+float *d_temp;
+float *d_front;
 int *d_eliminated;
 int *d_scanoutput;
-double *d_temp2;
+float *d_temp2;
 
 /* new hypervolume variables */
 FRONT *frontsArray;      // the stack of fronts
 int *indexStack;        // the indices of the contributing points
-double *hvStack;     // partial volumes
-double *ehvStack;    // exclusive volumes
+float *hvStack;     // partial volumes
+float *ehvStack;    // exclusive volumes
 
 /* new cuda variables */
-double *d_frontsArray;
-double *d_indexStack;
-double *d_hvStack;
-double *d_ehvStack;
+FRONT *d_frontsArray;
+float *d_hvStack;
+float *d_ehvStack;
 
 //NOte: n is needed for slicing and sorting, iteration is needed for saving array of fronts when going deeper into recursion
 
@@ -79,7 +84,7 @@ double *d_ehvStack;
 /**
  * Sprimes a front in parallel.
  */
-__global__ void sprimeFront(double *frPoints_device, double *frontPoints_device, int index) {
+__global__ void sprimeFront(float *frPoints_device, float *frontPoints_device, int index) {
 	frPoints_device[blockIdx.x*blockDim.x+threadIdx.x] = MIN(frontPoints_device[index*blockDim.x+threadIdx.x], 
 	frontPoints_device[(blockIdx.x+1+index)*blockDim.x+threadIdx.x]);
 }
@@ -93,7 +98,7 @@ __global__ void sprimeFront(double *frPoints_device, double *frontPoints_device,
  * returns -1 if point a dominates b
  * returns 2 if point is equal
  */
-__device__ int dominated(double *point_a, double *point_b, int nDim) {
+__device__ int dominated(float *point_a, float *point_b, int nDim) {
 	int result = 2;
 	for (int i = 0; i < nDim; i++) {
 		if (point_a[i] > point_b[i]) {
@@ -112,7 +117,7 @@ __device__ int dominated(double *point_a, double *point_b, int nDim) {
  * e.g. result of a front with 5 points: [0, 1, 1, 0, 1]. 
  * (known "trivial" bug: equal points will not be eliminated). 
  */
-__global__ void computeEliminatedArray(double *d_fr_iteration, int nDim, int *eliminated) {
+__global__ void computeEliminatedArray(float *d_fr_iteration, int nDim, int *eliminated) {
     	__shared__ int flag;
 
     	flag = 1;
@@ -131,7 +136,7 @@ __global__ void computeEliminatedArray(double *d_fr_iteration, int nDim, int *el
 /**
  * Insert the results and reorder into temp array in parallel.
  */ 
-__global__ void insertResults(double *d_fr_iteration, double *temp, int *eliminated, int *scanoutput) {
+__global__ void insertResults(float *d_fr_iteration, float *temp, int *eliminated, int *scanoutput) {
 	if (eliminated[blockIdx.x] == 1) {
 		//insert the non-dominated points
 		temp[(scanoutput[blockIdx.x]-1)*blockDim.x+threadIdx.x] = d_fr_iteration[blockIdx.x*blockDim.x+threadIdx.x];
@@ -163,21 +168,6 @@ __global__ void scan_inclusive(int *d_scanbest, int *d_eliminated, int nPoints) 
 /////////////////////////////////////////////////////////
 // Helper methods
 /////////////////////////////////////////////////////////
-
-/**
- * Check if kernel execution generated an error.
- * Report the CUDA error.
- * Run the method after each kernel execution.
- */
-void checkCUDAError(const char *msg)
-{
-    cudaError_t err = cudaGetLastError();
-    if( cudaSuccess != err) 
-    {
-        fprintf(stderr, "Cuda error: %s: %s.\n", msg, cudaGetErrorString(err) );
-        exit(-1);
-    }                         
-}
 
 /**
  * Prefix-sum sequential on CPU. (Deprecated)
@@ -233,51 +223,6 @@ int dominated(POINT a, POINT b) {
 }
 
 /**
- * Returns a sprimed & non-dominating front relative to point p at index.
- */
-void limitset(int index, FRONT front) {
-	int z = front.nPoints-1-index;
-	
-	/* <1> copy front to device memory */
-	double h_front[front.nPoints*n];
-	for (int i = 0; i < front.nPoints; i++) {
-		for (int j = 0; j < n; j++) {
-			h_front[i*n+j] = front.points[i].objectives[j];
-		}
-	}
-	cudaMemcpy(d_front, h_front, front.nPoints*n*sizeof(double), cudaMemcpyHostToDevice);
-
-	/* <2> Sprimes the front */
-	sprimeFront<<< z, n >>>( d_temp, d_front, index);
-    	cudaThreadSynchronize(); // block until the device has completed
-
-	/* <3> Compute eliminated array */
-	computeEliminatedArray<<< z, z >>>(d_temp, n, d_eliminated);
-	cudaThreadSynchronize();
-	
-	/* <4> Compute prefix-sum in parallel */
-	scan_best<<< 256, 512/2, sizeof(int)*(512) >>>(d_scanoutput, d_eliminated, 512);
-	cudaThreadSynchronize();
-	scan_inclusive<<< 1, z >>>(d_scanoutput, d_eliminated, z);  //make the result into an inclusive scan result.
-	cudaThreadSynchronize();
-
-	/* <5> Insert the results into temp buffer */
-	insertResults<<<z,n>>> (d_temp, d_temp2, d_eliminated, d_scanoutput);
-	cudaThreadSynchronize();
-	
-	/* <6> Copy final results from device buffer back to host */
-	cudaMemcpy(h_front, d_temp2, z*n*sizeof(double), cudaMemcpyDeviceToHost);
-	for (int i = 0; i < z; i++) {
-		for (int j = 0; j < n; j++) {
-			fr[iteration].points[i].objectives[j] = h_front[i*n+j];
-		}
-	}
-
-	/* <7> Update number of points */
-	cudaMemcpy(&fr[iteration].nPoints, &d_scanoutput[z-1], sizeof(int), cudaMemcpyDeviceToHost); //update number of points
-}
-
-/**
  * compare function for qsort sorting front in the last objective, i.e. increasing from top to bottom
  * and we process hypervolumes from the bottom 
  */
@@ -294,10 +239,10 @@ int compare (const void *a, const void *b)
 /**
  * Returns the size of exclusive hypervolume of point p at index relative to a front set.
  */
-double ehv(int index, FRONT front) {
+float ehv(int index, FRONT front) {
 	
 	//hypervolume of a single poinit
-	double ehv = 1;
+	float ehv = 1;
 	for (int i = 0; i < n; i++) {
 		ehv *= front.points[index].objectives[i];
 	}
@@ -316,13 +261,13 @@ double ehv(int index, FRONT front) {
 /**
  * Returns the size of hypervolume of a front.
  */
-double hypervolume(FRONT front) {
+float hypervolume(FRONT front) {
 	//sort the front with qsort
 	qsort(front.points, front.nPoints, sizeof (POINT), compare);
 	
 	//calculate for base case = 2D
 	if (n==2) {
-		double vol2d = (front.points[0].objectives[0] * front.points[0].objectives[1]);
+		float vol2d = (front.points[0].objectives[0] * front.points[0].objectives[1]);
 		for (int i = 1; i < front.nPoints; i++) {
 			vol2d += (front.points[i].objectives[0]) * 
 						   (front.points[i].objectives[1] - front.points[i - 1].objectives[1]);
@@ -330,7 +275,7 @@ double hypervolume(FRONT front) {
 		return vol2d;
 	}
 	
-	double sumhv = 0;
+	float sumhv = 0;
 	n--;
 	//sum all the segments
 	for (int i = front.nPoints - 1; i >= 0; i--)
@@ -454,15 +399,180 @@ void hvnew() {
 }
 
 /**
+ *  Timer Functions
+ */
+void run(int argc, char *argv[])
+{
+    unsigned int timer = 0;
+
+    CUT_DEVICE_INIT(argc, argv);
+
+    /////////////////////////////////////////////////////////////////////
+    // Create and start a timer called "timer"
+    // alls to create ans start times are enveloped in the CUT_SAFE_CALL
+    // This CUDA Utility Tool checks for errors upon return.
+    // If an error is found, it prints out and error message, file name,
+    // and line number in file where the error can be found
+    /////////////////////////////////////////////////////////////////////
+    timer = 0;
+    CUT_SAFE_CALL(cutCreateTimer(&timer));
+    CUT_SAFE_CALL(cutStartTimer(timer));
+    
+    // Stop the timer
+    CUT_SAFE_CALL(cutStopTimer(timer));
+    printf( "Processing time: %f (ms)\n", cutGetTimerValue(timer));
+
+    // Delete the timer
+    CUT_SAFE_CALL(cutDeleteTimer(timer));
+}
+
+/**
  * Runs a parallel hypervolume
  */ 
-__global__ void hvparallel() {
+__global__ void hvparallellol() {
 	// Should call many device functions
 
-	sortParallel();
+	//sortParallel();
 
-	d_indexStack[0] = d_frontsArray[0].nPoints - 1;
+	//d_indexStack[0] = d_frontsArray[0].nPoints - 1;
 	
+}
+
+/**
+ * Runs a parallel hypervolume
+ */
+//void hvparallel() {
+	/*int blockSize = 100;
+	int nBlocks = N/blockSize + (N%blockSize == 0 ? 0:1);
+	// where N is the parallel threads required
+
+	global<<<nBlocks, blockSize>>> ( param , N );
+
+	cudaThreadSynchronize();
+	checkCUDAError("HV parallel failed!");*/
+//}
+
+////////////////////////////////////////////////////////////////
+// CUDA Helpers
+////////////////////////////////////////////////////////////////
+
+/**
+ * Returns a sprimed & non-dominating front relative to point p at index.
+ */
+void limitset() {
+	// TODO make this a kernel which calls many device functions 
+
+	// sets the number of points in sprimed front
+	int z = frontsArray[iteration-1].nPoints - 1 - indexStack[iteration-1];
+	
+	// sprimes the front and store it into temporary storage
+	sprimeFront<<< z, n >>>( d_temp, d_frontsArray, indexStack[iteration-1]);
+    	cudaThreadSynchronize();
+
+	// compute eliminated array and store it in d_eliminated
+	computeEliminatedArray<<< z, z >>>(d_temp, n, d_eliminated);
+	cudaThreadSynchronize();
+	
+	// compute parallel prefix sum and store the result in d_scanoutput
+	// TODO may need to make use of cudpp for this
+	scan_best<<< 256, 512/2, sizeof(int)*(512) >>>(d_scanoutput, d_eliminated, 512);
+	cudaThreadSynchronize();
+	scan_inclusive<<< 1, z >>>(d_scanoutput, d_eliminated, z);  //make the result into an inclusive scan result.
+	cudaThreadSynchronize();
+
+	// compute the results and store it in frontArray
+	insertResults<<<z,n>>> (d_temp, &frontsArray[iteration], d_eliminated, d_scanoutput);
+	cudaThreadSynchronize();
+
+	// update number of points to the host
+	cudaMemcpy(&indexStack[iteration], &d_scanoutput[z-1], sizeof(int), cudaMemcpyDeviceToHost); //update number of points
+}
+
+/**
+ * @param front front to sort
+ * @param numElements number of points
+ * @param size size of each point
+ */
+void sortParallel(float *d_points, int numElements, int size) {
+	// set the config
+	CUDPPConfiguration config;
+	config.op = CUDPP_ADD;
+	config.datatype = CUDPP_FLOAT;
+	config.algorithm = CUDPP_SORT_RADIX;
+	config.options = CUDPP_OPTION_FORWARD;
+	
+	// create the plan
+	CUDPPHandle sortPlan = 0;
+	CUDPPResult result = cudppPlan(&sortPlan, config, numElements, 1, 0);  
+
+	// if not successful then exit
+	if (CUDPP_SUCCESS != result)
+	{
+		printf("Error creating CUDPPPlan\n");
+		exit(-1);
+	}
+
+	// Run the sort TODO make the sorting works
+	cudppSort(sortPlan, d_out, d_in, numElements);
+
+	// Destroy the plan
+	result = cudppDestroyPlan(scanplan);
+	if (CUDPP_SUCCESS != result)
+	{
+		printf("Error destroying CUDPPPlan\n");
+		exit(-1);
+	}
+
+	// TODO reuse config and destroy plan at the end
+}
+
+//////////////////////////////////////////////////////////
+//  HV CUDA
+//////////////////////////////////////////////////////////
+
+void hvparallel(int nPoints) {
+	// sort in parallel
+	sortParallel(frontsArray[0].points, nPoints, sizeof(POINT));
+
+	indexStack[0] = nPoints - 1;
+
+	// TODO host cannot access device memory ehv, and hv and frontsArray, need CUDA kernels for this
+	while (indexStack[0] >= 0) {
+		if (indexStack[iteration] < 0) {
+			iteration--; 
+      			ehvStack[iteration] = ehvStack[iteration] - hvStack[iteration+1]; 
+      			hvStack[iteration] = hvStack[iteration] + (frontsArray[iteration].points[indexStack[iteration]].objectives[n]) * ehvStack[iteration];
+       			indexStack[iteration]--;
+       			n++;
+		} else if (n == 2) {
+			iteration--;
+       			ehvStack[iteration] -= frontsArray[iteration+1].points[0].objectives[0] * frontsArray[iteration+1].points[0].objectives[1]; 
+       			for (int i = 1; i < frontsArray[iteration+1].nPoints; i++) {
+         			ehvStack[iteration] -= (frontsArray[iteration+1].points[i].objectives[0]) * 
+							(frontsArray[iteration+1].points[i].objectives[1] - frontsArray[iteration+1].points[i-1].objectives[1]);
+			}
+       			hvStack[iteration] += frontsArray[iteration].points[indexStack[iteration]].objectives[n] * ehvStack[iteration];
+      			indexStack[iteration]--;
+       			n++;
+		} else {
+      			n--;
+       			ehvStack[iteration] = 1;
+       			for (int i = 0; i < n; i++)  {
+         			ehvStack[iteration] *= frontsArray[iteration].points[indexStack[iteration]].objectives[i];
+			}
+
+       			if (indexStack[iteration] == frontsArray[iteration].nPoints - 1) {
+        			hvStack[iteration] = frontsArray[iteration].points[indexStack[iteration]].objectives[n] * ehvStack[iteration];
+          			indexStack[iteration]--;
+          			n++;
+			} else {
+         			iteration++; 
+          			makeDominatedBit(); 
+          			sortParallel(frontsArray[iteration].points, indexStack[iteration], sizeof(POINT));
+          			indexStack[iteration]--;
+			}
+		}
+	}
 }
 
 /////////////////////////////////////////////////////////
@@ -470,9 +580,12 @@ __global__ void hvparallel() {
 /////////////////////////////////////////////////////////
 
 int main(int argc, char *argv[]) {
+	//CUT_DEVICE_INIT(argc, argv);
 	
+	// read the file
 	FILECONTENTS *f = readFile(argv[1]);
 	
+	// start the timer
 	struct timeval tv1, tv2;
 	struct rusage ru_before, ru_after;
 	getrusage (RUSAGE_SELF, &ru_before);
@@ -480,91 +593,76 @@ int main(int argc, char *argv[]) {
 	int maxDimensions = 0;	//the max number of dimensions in the fronts
 	int maxPoints = 0;  //the max number of points in the fronts
 	
-	//find the max number of Points, and the max number of Dimensions
+	// find the max number of Points, and the max number of Dimensions
 	for (int i = 0; i < f->nFronts; i++) {
 		if (f->fronts[i].nPoints > maxPoints) 
 			maxPoints = f->fronts[i].nPoints;
 		if (f->fronts[i].n > maxDimensions) 
 			maxDimensions = f->fronts[i].n;
   	}
-	
-	int maxd = maxDimensions-2;
-	//allocate an array of fronts for nDimensions
-	fr = (FRONT *) malloc(sizeof(FRONT) * maxd);
-	for (int i = 0; i < maxd; i++) {
-		fr[i].points = (POINT *) malloc(sizeof(POINT) * maxPoints);
-		for (int j = 0; j < maxPoints; j++) {
-		//only need to malloc for n (number of Dimensions)
-			fr[i].points[j].objectives = (OBJECTIVE *) malloc(sizeof(OBJECTIVE) * (maxDimensions - (i+1)));
-		}
-	}
 
 	/* allocate for cuda memory */
-	cudaMalloc( (void **) &d_temp, maxPoints*maxDimensions*sizeof(double));
+	cudaMalloc( (void **) &d_temp, maxPoints*maxDimensions*sizeof(float));
 	cudaMalloc((void **) &d_scanoutput, (512)*sizeof(int));
 	cudaMalloc((void **) &d_eliminated, (512)*sizeof(int));
-	cudaMalloc( (void **) &d_front, maxPoints*maxDimensions*sizeof(double));
-	cudaMalloc((void**) &d_temp2, sizeof(double)*maxPoints*maxDimensions);
+	cudaMalloc( (void **) &d_front, maxPoints*maxDimensions*sizeof(float));
+	cudaMalloc((void**) &d_temp2, sizeof(float)*maxPoints*maxDimensions);
 	
-	/* new cuda allocation */
-	int frontSize = maxPoints*maxDimensions*sizeof(double);
+	// allocate cuda memory
+	frontSize = maxPoints*maxDimensions*sizeof(float);
+	pointSize = maxDimensions*sizeof(float);
 	cudaMalloc((void **) &d_frontsArray, frontSize * maxDimensions);
-	cudaMalloc((void **) &d_indexStack, sizeof(int) * maxDimensions);
-	cudaMalloc((void **) &d_ehvStack, sizeof(double) * maxDimensions);
-	cudaMalloc((void **) &d_hvStack, sizeof(double) * maxDimensions);
+	cudaMalloc((void **) &d_ehvStack, sizeof(float) * maxDimensions);
+	cudaMalloc((void **) &d_hvStack, sizeof(float) * maxDimensions);
 
-	// allocate memory
-	frontsArray = (FRONT *) malloc(sizeof(FRONT) * (maxDimensions /* - 1 */));
-	for (int i = 1; i < maxDimensions /* - 1 */; i++) {
-	frontsArray[i].points = (POINT *) malloc(sizeof(POINT) * maxPoints);
-		for (int j = 0; j < maxPoints; j++) {
-			frontsArray[i].points[j].objectives = (OBJECTIVE *) malloc(sizeof(OBJECTIVE) * (maxDimensions /* - (i + 1) */)); 
-		}
-	}
-	indexStack  = (int *) malloc(sizeof(int)    * (maxDimensions /* - 2 */));
-	ehvStack = (double *) malloc(sizeof(double) * (maxDimensions /* - 2 */));
-	hvStack  = (double *) malloc(sizeof(double) * (maxDimensions /* - 1 */));
+	// allocate cpu memory
+	indexStack = (int *) malloc(sizeof(int) * maxDimensions);
 
-	//process each front to get the hypervolumes
+	// process each front to get the hypervolumes
 	for (int i = 0; i < f->nFronts; i++) {
-		frontsArray[0] = f->fronts[i];
-		n = f->fronts[i].n;
+		// read each front
+		FRONT front = f->fronts[i];
+		n = front.n;
 
-		/* copy front to device memory */
-		double h_front[frontsArray[0].nPoints*n];
-		for (int j = 0; j < frontsArray[0].nPoints; j++) {
+		// copy front to device memory
+		float h_front[front.nPoints*n]; 
+		for (int j = 0; j < front.nPoints; j++) {
 			for (int k = 0; k < n; k++) {
-				h_front[j*n+k] = frontsArray[0].points[j].objectives[k];
+				h_front[j*n+k] = front.points[j].objectives[k];
 			}
 		}
-		cudaMemcpy(d_frontsArray, h_front, frontsArray[0].nPoints*n*sizeof(double), cudaMemcpyHostToDevice);
+		cudaMemcpy(d_frontsArray, h_front, frontSize, cudaMemcpyHostToDevice);		
 
+		// run hv parallel
+		hvparallel(front.nPoints);
 
-		hvnew(); 
+ 		// copy back hvresult
+		float hvResult[1];
+		cudaMemcpy(hvResult, &d_hvStack[0], sizeof(float), cudaMemcpyDeviceToHost);
+
+		// print them out
 		printf("Calculating Hypervolume for Front:%d...\n", i+1);
-		printf("\t\t\t\t\t%1.10f\n", hvStack[0]);
+		printf("\t\t\t\t\t%1.10f\n", hvResult);
 	}
 	
+	// stop timer
 	getrusage (RUSAGE_SELF, &ru_after);
 	tv1 = ru_before.ru_utime;
 	tv2 = ru_after.ru_utime;
 	printf("Average time = %fs\n", (tv2.tv_sec + tv2.tv_usec * 1e-6 - tv1.tv_sec - tv1.tv_usec * 1e-6) / f->nFronts);
-	
-	//free the storage
-	for (int i = 0; i < maxd; i++) {
-		for (int j = 0; j < maxPoints; j++) {
-			free(fr[i].points[j].objectives);
-		}
-		free(fr[i].points);
-	}
-	free(fr);
 
-	/* free cuda memory */
-	cudaFree(d_temp);
-	cudaFree(d_temp2);
-	cudaFree(d_scanoutput);
-	cudaFree(d_front);
-	cudaFree(d_eliminated);
+	// TODO free the storage
 
 	return 0;
 }
+
+void checkCUDAError(const char *msg)
+{
+    cudaError_t err = cudaGetLastError();
+    if( cudaSuccess != err) 
+    {
+        fprintf(stderr, "Cuda error: %s: %s.\n", msg, cudaGetErrorString(err) );
+        exit(-1);
+    }                         
+}
+
