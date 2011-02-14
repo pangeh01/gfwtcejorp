@@ -538,20 +538,34 @@ void limitset() {
 }
 
 /**
+ * prints a front located on device
+ */
+void printfront(float *d_front, int numPoints) {
+	printf("----------------------------------\n");
+	float *front = (float *) malloc(frontSize*sizeof(float));
+	cudaMemcpy(front, d_front, frontSize*sizeof(float), cudaMemcpyDeviceToHost);
+	for (int i = 0; i < numPoints; i++) {
+		for (int j = 0; j < n; j++) {
+			printf("%1.1f ", front[i*pointSize+j]);
+		}
+		printf("\n");
+	}
+	printf("----------------------------------\n");
+	free(front);
+}
+
+/**
  * @param front front to sort
  * @param numElements number of points
  * @param size size of each point
  */
-void sortParallel(float *d_in, int numElements) {
-	// TODO need to fix this elements, see cudpp api for sorting 
-	// TODO how can we sort a FRONT datatype instead of floating data types
-	// TODO numElements is the number of points or the number of floats in the front or the number of floats in the point
+void parallelSort(float *d_in, int numElements) {
 
 	// set the config
 	CUDPPConfiguration config;
-	config.op = CUDPP_ADD;
+	//config.op = CUDPP_MAX;
 	config.datatype = CUDPP_FLOAT;
-	config.algorithm = CUDPP_SORT_RADIX;
+	config.algorithm = CUDPP_SORT_RADIX_GLOBAL;
 	config.options = CUDPP_OPTION_FORWARD;
 	
 	// create the plan
@@ -565,12 +579,19 @@ void sortParallel(float *d_in, int numElements) {
 		exit(-1);
 	}	
 	
+	// allocate array for sorted results
+	float *d_out;
+	cudaMalloc( (void **) &d_out, numElements*sizeof(float));
+
 	// Run the sort 
-	// TODO make the sorting works
 	cudppSort(sortPlan, d_out, d_in, numElements);
 
+	// TODO reassign pointers and remove costly memcpy operation
+	//d_in = d_out;
+	cudaMemcpy(d_in, d_out, numElements*sizeof(float), cudaMemcpyDeviceToDevice);
+
 	// Destroy the plan
-	result = cudppDestroyPlan(scanplan);
+	result = cudppDestroyPlan(sortPlan);
 	if (CUDPP_SUCCESS != result)
 	{
 		printf("Error destroying CUDPPPlan\n");
@@ -580,16 +601,74 @@ void sortParallel(float *d_in, int numElements) {
 	// TODO reuse config and destroy plan at the end
 }
 
+__device__ int binarySearch(float *array, float value, int low, int high) {
+       while (low <= high) {
+	int mid = (low+high) / 2;
+	if (array[mid] > value)
+		high = mid-1;
+	else if (array[mid] < value) 
+		low = mid+1;
+	else 
+		return mid; //found
+	}
+	return -1; //not found
+}
+
+
+__global__ void arrange(float *d_out, float *d_in, float *lastObjectives, int objective, int pointSize) {
+	
+	// conduct binary search on the last objectives
+	int location = binarySearch(lastObjectives, d_in[threadIdx.x*pointSize+objective], 0, blockDim.x);
+	
+	// rearrange into a temporary array
+	for (int i = 0; i < pointSize; i++) {
+		d_out[location*pointSize+i] = d_in[threadIdx.x*pointSize+i];
+	}
+	
+}
+
+__global__ void sort(float *lastObjectives, float *d_in, int i, int pointSize) {
+	lastObjectives[threadIdx.x] = d_in[threadIdx.x*pointSize+i];
+}
+
+void sortPoints(float *d_in, int numElements) {
+	float *lastObjectives;
+	cudaMalloc( (void **) &lastObjectives, numElements*sizeof(float));
+
+	// sorts starting at the last objective
+	for (int i = n-1; i >= n-1; i--) {	
+	//for (int i = n-1; i >= 0; i--) {
+		// TODO sorting from the last objective doesn't work
+		// set the lastObjectives to be sorted		
+		sort<<<1, numElements>>>(lastObjectives, d_in, i, pointSize);
+
+		//sorts the lastObjectives
+		parallelSort(lastObjectives, numElements);
+printfront(lastObjectives, 12);
+		// allocate array for arranged results
+		float *d_out;
+		cudaMalloc( (void **) &d_out, numElements*pointSize*sizeof(float));
+printfront(d_in, numElements);
+		//arrange the order according to the last objectives
+		arrange<<< 1, numElements>>>(d_out, d_in, lastObjectives, i, pointSize);
+printfront(d_out, numElements);
+		// copy d_out back to d_in
+		cudaMemcpy(d_in, d_out, numElements*pointSize*sizeof(float), cudaMemcpyDeviceToDevice);
+	} 
+
+	cudaFree(lastObjectives);
+}
+
 //////////////////////////////////////////////////////////
 //  HV CUDA
 //////////////////////////////////////////////////////////
 
 void hvparallel() {
 
-	// sort in parallel
-	sortParallel(d_frontsArray[frontSize*0], nPointsStack[0], sizeof(POINT)); // sorts the points located in front[0], use nPointsStack[0] for the number of points
+	// sort the array
+	sortPoints(&d_frontsArray[frontSize*0], nPointsStack[0]); // sorts the points located in front[0], use nPointsStack[0] for the number of points
 
-	indexStack[0] = nPoints - 1;
+	indexStack[0] = nPointsStack[0] - 1;
 
 	// TODO host cannot access device memory ehv, and hv and frontsArray, need CUDA kernels for this
 	// TODO d_frontsArray , d_hvStack and d_ehvStack is not possible
@@ -624,7 +703,7 @@ void hvparallel() {
 			} else {
          			iteration++; 
           			makeDominatedBit(); 
-          			sortParallel(d_frontsArray[frontSize*iteration], nPointsStack[iteration], sizeof(POINT));
+          			sortPoints(&d_frontsArray[frontSize*iteration], nPointsStack[iteration]);
           			indexStack[iteration] = nPointsStack[iteration]-1;
 			}
 		}
@@ -683,13 +762,13 @@ int main(int argc, char *argv[]) {
 		nPointsStack[0] = front.nPoints;
 
 		// copy front to device memory
-		float h_front[front.nPoints*n]; 
+		float h_front[front.nPoints*pointSize]; 
 		for (int j = 0; j < front.nPoints; j++) {
 			for (int k = 0; k < n; k++) {
-				h_front[j*n+k] = front.points[j].objectives[k];
+				h_front[j*pointSize+k] = front.points[j].objectives[k];
 			}
 		}
-		cudaMemcpy(d_frontsArray, h_front, frontSize, cudaMemcpyHostToDevice);		
+		cudaMemcpy(d_frontsArray, h_front, frontSize*sizeof(float), cudaMemcpyHostToDevice);		
 
 		// run hv parallel
 		hvparallel();

@@ -6,7 +6,7 @@
 #include <string.h>
 
 //an objective is a value needed to be optimised
-typedef double OBJECTIVE;
+typedef float OBJECTIVE;
 
 //each point has a set number of objectives.
 typedef struct
@@ -27,7 +27,7 @@ typedef struct
         FRONT sprime;   // reduced front 
         int id;         // index in the original list 
         int k;          // next segment to be evaluated 
-        double partial; // volume so far 
+        float partial; // volume so far 
         int left;       // left child in the heap 
         int right;      // right child in the heap 
 } JOB;
