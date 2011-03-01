@@ -114,13 +114,13 @@ __device__ int dominated(float *point_a, float *point_b, int nDim) {
  * e.g. result of a front with 5 points: [0, 1, 1, 0, 1]. 
  * (known "trivial" bug: equal points will not be eliminated). 
  */
-__global__ void computeEliminatedArray(float *d_fr_iteration, int nDim, int *eliminated) {
+__global__ void computeEliminatedArray(float *d_fr_iteration, int nDim, int *eliminated, int pointSize) {
     	__shared__ int flag;
 
     	flag = 1;
 	__syncthreads();
 
-	if (dominated(&d_fr_iteration[blockIdx.x*nDim] , &d_fr_iteration[threadIdx.x*nDim], nDim) == 1)
+	if (dominated(&d_fr_iteration[blockIdx.x*pointSize] , &d_fr_iteration[threadIdx.x*pointSize], nDim) == 1)
 		flag = 0;
 
 	__syncthreads();
@@ -133,10 +133,10 @@ __global__ void computeEliminatedArray(float *d_fr_iteration, int nDim, int *eli
 /**
  * Insert the results and reorder into temp array in parallel.
  */ 
-__global__ void insertResults(float *d_fr_iteration, float *temp, int *eliminated, int *scanoutput) {
+__global__ void insertResults(float *d_fr_iteration, float *temp, int *eliminated, int *scanoutput, int pointSize) {
 	if (eliminated[blockIdx.x] == 1) {
 		//insert the non-dominated points
-		temp[(scanoutput[blockIdx.x]-1)*blockDim.x+threadIdx.x] = d_fr_iteration[blockIdx.x*blockDim.x+threadIdx.x];
+		temp[(scanoutput[blockIdx.x]-1)*pointSize+threadIdx.x] = d_fr_iteration[blockIdx.x*pointSize+threadIdx.x];
 	} /*else {
 		//if eliminated insert at the end of the temp array.
 		temp[(gridDim.x-1-(blockIdx.x-scanoutput[blockIdx.x]))*blockDim.x+threadIdx.x] = d_fr_iteration[blockIdx.x*blockDim.x+threadIdx.x];
@@ -253,7 +253,7 @@ void limitset(int index, FRONT front) {
     	cudaThreadSynchronize(); // block until the device has completed
 
 	/* <3> Compute eliminated array */
-	computeEliminatedArray<<< z, z >>>(d_temp, n, d_eliminated);
+	//computeEliminatedArray<<< z, z >>>(d_temp, n, d_eliminated);
 	cudaThreadSynchronize();
 	
 	int N = z;
@@ -267,7 +267,7 @@ void limitset(int index, FRONT front) {
 	cudaThreadSynchronize();
 
 	/* <5> Insert the results into temp buffer */
-	insertResults<<<z,n>>> (d_temp, d_temp2, d_eliminated, d_scanoutput);
+	//insertResults<<<z,n>>> (d_temp, d_temp2, d_eliminated, d_scanoutput);
 	cudaThreadSynchronize();
 	
 	/* <6> Copy final results from device buffer back to host */
@@ -539,7 +539,7 @@ printf("blah\n");
     	cudaThreadSynchronize();
 
 	// compute eliminated array and store it in d_eliminated
-	computeEliminatedArray<<< z, z >>>(d_temp, n, d_eliminated);
+	computeEliminatedArray<<< z, z >>>(d_temp, n, d_eliminated, pointSize);
 	cudaThreadSynchronize();
 	
 	// compute parallel prefix sum and store the result in d_scanoutput
@@ -550,7 +550,7 @@ printf("blah\n");
 	cudaThreadSynchronize();
 
 	// compute the results and store it in frontArray
-	insertResults<<<z,n>>> (d_temp, &d_frontsArray[frontSize*iteration], d_eliminated, d_scanoutput);
+	insertResults<<<z,n>>> (d_temp, &d_frontsArray[frontSize*iteration], d_eliminated, d_scanoutput, pointSize);
 	cudaThreadSynchronize();
 
 	// update number of points to the host
@@ -588,7 +588,7 @@ void parallelSort(float *d_in, int numElements) {
 	cudaMalloc( (void **) &d_out, numElements*sizeof(float));
 
 	// Run the sort 
-	cudppSort(sortPlan, d_out, d_in, numElements);
+	cudppSort(sortPlan, d_out, d_in, d_in, numElements);
 
 	// TODO reassign pointers and remove costly memcpy operation
 	//d_in = d_out;
@@ -619,49 +619,96 @@ __device__ int binarySearch(float *array, float value, int low, int high) {
 }
 
 
-__global__ void arrange(float *d_out, float *d_in, float *lastObjectives, int objective, int pointSize) {
+__global__ void arrange(float *d_out, float *d_in, float *sortedScore, float *scoreBoard, int pointSize) {
 	
 	// conduct binary search on the last objectives
-	int location = binarySearch(lastObjectives, d_in[threadIdx.x*pointSize+objective], 0, blockDim.x);
-	
+	int location = binarySearch(sortedScore, scoreBoard[threadIdx.x], 0, blockDim.x);
+
 	// rearrange into a temporary array
-	for (int i = 0; i < pointSize; i++) {
+	for (int i = 0; i < pointSize; i++) { //change pointSize to objective+1?
 		d_out[location*pointSize+i] = d_in[threadIdx.x*pointSize+i];
 	}
 	
 }
 
-__global__ void sort(float *lastObjectives, float *d_in, int i, int pointSize) {
-	lastObjectives[threadIdx.x] = d_in[threadIdx.x*pointSize+i];
+__global__ void initialise(float *scoreBoard) {
+	scoreBoard[threadIdx.x] = 0;
 }
 
-void sortPoints(float *d_in, int numElements) {
+__global__ void runScore(float *scoreBoard, float *d_in, int factor, int n, int pointSize) {
+	for (int i = 0; i < n; i++) {
+		scoreboard[threadIdx.x] = scoreboard[threadIdx.x] + factor^(i+1)*d_in[pointSize*threadIdx.x+i];
+	}
+}
+
+/*__global__ void sort(float *lastObjectives, float *d_in, int i, int pointSize) {
+	lastObjectives[threadIdx.x] = d_in[threadIdx.x*pointSize+i];
+}*/
+
+/*void sortPoints(float *d_in, int numElements) {
 	float *lastObjectives;
 	cudaMalloc( (void **) &lastObjectives, numElements*sizeof(float));
+	float *wrapper;
+	cudaMalloc( (void **) &wrapper, numElements*sizeof(float));
+	initialiseWrapper<<< 1, numElements>>>(wrapper);
+
+	float factor = 0.001;
 
 	// sorts starting at the last objective
-	for (int i = n-1; i == n-1; i--) {	
-	//for (int i = n-1; i >= 0; i--) {
+	//for (int i = n-1; i == n-1; i--) {	
+	for (int i = n-1; i >= 0; i--) { //TODO this sorting problem have to be fixed
 
 		// set the lastObjectives to be sorted		
-		sort<<<1, numElements>>>(lastObjectives, d_in, n-1, pointSize);
+		sort<<<1, numElements>>>(lastObjectives, d_in, i, pointSize);
 
 		//sorts the lastObjectives
 		parallelSort(lastObjectives, numElements);
+		
+		// add the small increment
+		addSmallIncrement<<<1, numElements >>>(wrapper, lastObjectives, factor);
 
 		// allocate array for arranged results
 		float *d_out;
 		cudaMalloc( (void **) &d_out, numElements*pointSize*sizeof(float));
 
 		//arrange the order according to the last objectives
-		arrange<<< 1, numElements>>>(d_out, d_in, lastObjectives, n-1, pointSize);
+		arrange<<< 1, numElements>>>(d_out, d_in, wrapper, i, pointSize);
 
 		// copy d_out back to d_in
 		cudaMemcpy(d_in, d_out, numElements*pointSize*sizeof(float), cudaMemcpyDeviceToDevice);
+	
+		factor = factor * 0.001;
 	} 
 
 	cudaFree(lastObjectives);
+}*/
+
+
+void sortPoints(float *d_in, int numElements) {
+	float *scoreBoard;
+	cudaMalloc( (void **) &scoreBoard, numElements*sizeof(float));
+
+	initialise<<< 1, numElements>>>(scoreBoard);
+
+	factor = 10;
+	runScore<<< 1, numElements>>> (scoreBoard, d_in, factor, n, pointSize);
+
+	float *sortedScore;
+	cudaMalloc( (void **) &sortedScore, numElements*sizeof(float));
+	cudaMemcpy( sortedScore, scoreBoard, numElements*sizeof(float), cudaMemcpyDeviceToDevice);
+	parallelSort(sortedScore, numElements);
+
+	// allocate array for arranged results
+	float *d_out;
+	cudaMalloc( (void **) &d_out, numElements*pointSize*sizeof(float));
+
+	//arrange the order according to the last objectives
+	arrange<<< 1, numElements>>>(d_out, d_in, sortedScore, scoreBoard, pointSize);
+
+	// copy d_out back to d_in
+	cudaMemcpy(d_in, d_out, numElements*pointSize*sizeof(float), cudaMemcpyDeviceToDevice);
 }
+
 
 //////////////////////////////////////////////////////////
 //  HV CUDA

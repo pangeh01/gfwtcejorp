@@ -1,6 +1,6 @@
 SRC = src
 CFILE = wfg\ 12_iterative.c
-CUFILE = wfg\ 5.cu
+CUFILE = wfg\ 7.cu
 BIN = bin/read 
 QS  = src/qsort.cu
 TEST = src/test1.cu
